@@ -23,9 +23,17 @@ import BroadcastNotificationsView from './components/broadcasts/BroadcastNotific
 import WebsiteTrafficView from './components/analytics/WebsiteTrafficView.tsx';
 import IntegrationsView from './components/integrations/IntegrationsView.tsx';
 import AuditSessionsView from './components/audit/AuditSessionsView.tsx';
+import LaptopDatabaseView from './components/database/LaptopDatabaseView.tsx';
+import { apiFetch, getAuthToken } from './utils/api.ts';
+import {
+  getAutoSyncEnabled,
+  getLaptopDbStatus,
+  LaptopSnapshotPayload,
+  saveSnapshotToLaptopDb,
+} from './utils/laptopDb.ts';
 
 function WorkspaceApp() {
-  const { user, loading, refreshNotifications, refreshUser } = useAuth();
+  const { user, loading, refreshNotifications, refreshUser, subscribeRealtime } = useAuth();
   const [activeSection, setActiveSection] = useState<NavSection>('dashboard');
   const [newTicketOpen, setNewTicketOpen] = useState(false);
   const [selectedTicketId, setSelectedTicketId] = useState<number | null>(null);
@@ -57,6 +65,73 @@ function WorkspaceApp() {
       setShowLivePage(false);
     }
   }, [user?.id]);
+
+  // Background auto-sync between the server database and the Super Admin's Laptop Storage DB
+  useEffect(() => {
+    if (!user || user.role !== 'super_admin') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let running = false;
+
+    const runSync = async () => {
+      if (running || !getAutoSyncEnabled()) return;
+      running = true;
+      try {
+        const [snapshot, status] = await Promise.all([
+          apiFetch<LaptopSnapshotPayload>('/api/auth/security/laptop-snapshot'),
+          getLaptopDbStatus(),
+        ]);
+        let sqliteBlob: Blob | null = null;
+        if (status.linkedFileName && status.linkedPermission === 'granted') {
+          const headers = new Headers();
+          const token = getAuthToken();
+          if (token) headers.set('Authorization', `Bearer ${token}`);
+          const sqlRes = await fetch('/api/auth/security/backup?format=sqlite', {
+            headers,
+            credentials: 'include',
+          });
+          if (sqlRes.ok) sqliteBlob = await sqlRes.blob();
+        }
+        await saveSnapshotToLaptopDb(snapshot, { sqliteBlob, interactive: false });
+      } catch {
+        // Non-blocking background laptop sync
+      } finally {
+        running = false;
+      }
+    };
+
+    const scheduleSync = () => {
+      if (!getAutoSyncEnabled()) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        runSync();
+      }, 4500);
+    };
+
+    // Initial sync on Super Admin session start
+    runSync();
+    // Periodic safety sync every 2 minutes
+    const periodic = setInterval(runSync, 120000);
+
+    const unsub = subscribeRealtime((evt) => {
+      if (
+        evt.event.startsWith('ticket:') ||
+        evt.event.startsWith('asset:') ||
+        evt.event.startsWith('budget:') ||
+        evt.event.startsWith('directory:') ||
+        evt.event.startsWith('dropdowns:') ||
+        evt.event.startsWith('broadcast:') ||
+        evt.event === 'chat:message'
+      ) {
+        scheduleSync();
+      }
+    });
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      clearInterval(periodic);
+      unsub();
+    };
+  }, [user?.id, user?.role, subscribeRealtime]);
 
   if (loading) {
     return (
@@ -228,6 +303,8 @@ function WorkspaceApp() {
         return user.role === 'super_admin' ? <DropdownManagerView /> : null;
       case 'integrations':
         return user.role === 'super_admin' ? <IntegrationsView /> : null;
+      case 'database':
+        return user.role === 'super_admin' ? <LaptopDatabaseView /> : null;
       case 'audit':
         return user.role === 'super_admin' ? <AuditSessionsView /> : null;
       default:

@@ -5,7 +5,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import jwt from 'jsonwebtoken';
-import { db, UPLOAD_ROOT } from '../db.ts';
+import multer from 'multer';
+import Database from 'better-sqlite3';
+import { db, DB_PATH, UPLOAD_ROOT } from '../db.ts';
 import {
   type AuthRequest,
   getSuperAdminNotificationPrefs,
@@ -25,7 +27,17 @@ import {
   verifyTotpCode,
 } from '../security.ts';
 import { dispatchWhatsAppMessage, getEffectiveWhatsAppConfig } from '../integrations.ts';
-import { sendToRoles } from '../realtime.ts';
+import { broadcastAll, sendToRoles } from '../realtime.ts';
+
+const sqliteRestoreUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, _file, cb) => {
+      cb(null, `restore-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.db`);
+    },
+  }),
+  limits: { fileSize: 100 * 1024 * 1024, files: 1 },
+});
 
 const router = Router();
 const MFA_CHALLENGE_SECRET = process.env.JWT_SECRET || 'logicore-dev-secret-change-in-production';
@@ -1631,5 +1643,497 @@ router.get('/security/media-audit', requireAuth, requireRole('super_admin'), (_r
     chatFiles,
   });
 });
+
+// Full structured snapshot for the Super Admin's Laptop Local Database (IndexedDB & local disk file)
+router.get('/security/laptop-snapshot', requireAuth, requireRole('super_admin'), (_req: AuthRequest, res) => {
+  try {
+    let serverDbBytes = 0;
+    try {
+      if (fs.existsSync(DB_PATH)) {
+        serverDbBytes = fs.statSync(DB_PATH).size;
+      }
+    } catch {
+      // ignore stat errors
+    }
+
+    const tables = {
+      locations: db.prepare('SELECT * FROM locations ORDER BY id ASC').all(),
+      departments: db.prepare('SELECT * FROM departments ORDER BY id ASC').all(),
+      vendors: db.prepare('SELECT * FROM vendors ORDER BY id ASC').all(),
+      sla_configurations: db.prepare('SELECT * FROM sla_configurations ORDER BY id ASC').all(),
+      dropdown_options: db.prepare('SELECT * FROM dropdown_options ORDER BY id ASC').all(),
+      employees: db.prepare('SELECT * FROM employees ORDER BY id ASC').all(),
+      moderators: db.prepare('SELECT * FROM moderators ORDER BY id ASC').all(),
+      it_assets: db.prepare('SELECT * FROM it_assets ORDER BY id ASC').all(),
+      asset_maintenance: db.prepare('SELECT * FROM asset_maintenance ORDER BY id ASC').all(),
+      asset_history: db.prepare('SELECT * FROM asset_history ORDER BY id ASC').all(),
+      it_budgets: db.prepare('SELECT * FROM it_budgets ORDER BY id ASC').all(),
+      expenses: db.prepare('SELECT * FROM expenses ORDER BY id ASC').all(),
+      expense_approvals: db.prepare('SELECT * FROM expense_approvals ORDER BY id ASC').all(),
+      tickets: db.prepare('SELECT * FROM tickets ORDER BY id ASC').all(),
+      ticket_assignments: db.prepare('SELECT * FROM ticket_assignments ORDER BY id ASC').all(),
+      ticket_activities: db.prepare('SELECT * FROM ticket_activities ORDER BY id ASC').all(),
+      ticket_comments: db.prepare('SELECT * FROM ticket_comments ORDER BY id ASC').all(),
+      ticket_time_logs: db.prepare('SELECT * FROM ticket_time_logs ORDER BY id ASC').all(),
+      direct_messages: db.prepare('SELECT * FROM direct_messages ORDER BY id ASC').all(),
+      saved_reports: db.prepare('SELECT * FROM saved_reports ORDER BY id ASC').all(),
+      retention_policies: db.prepare('SELECT * FROM retention_policies').all(),
+      broadcast_notifications: db.prepare('SELECT * FROM broadcast_notifications ORDER BY id ASC').all(),
+      audit_logs: db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 5000').all(),
+    };
+
+    const tableCounts: Record<string, number> = {};
+    for (const [k, rows] of Object.entries(tables)) {
+      tableCounts[k] = Array.isArray(rows) ? rows.length : 0;
+    }
+
+    res.json({
+      system: 'SD Global IT CRM',
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      serverDbBytes,
+      tableCounts,
+      tables,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to build laptop database snapshot' });
+  }
+});
+
+const RESTORE_ORDER: Array<{
+  table: string;
+  mode: 'replace' | 'ignore';
+  columns: string[];
+}> = [
+  {
+    table: 'locations',
+    mode: 'replace',
+    columns: ['id', 'code', 'name', 'type', 'city', 'state', 'address', 'manager_name', 'created_at'],
+  },
+  {
+    table: 'departments',
+    mode: 'replace',
+    columns: ['id', 'name', 'code', 'cost_center'],
+  },
+  {
+    table: 'vendors',
+    mode: 'replace',
+    columns: ['id', 'name', 'category', 'contact_person', 'phone', 'email', 'tax_id', 'address', 'created_at'],
+  },
+  {
+    table: 'sla_configurations',
+    mode: 'replace',
+    columns: [
+      'id',
+      'priority',
+      'first_response_minutes',
+      'resolution_hours',
+      'working_hours_start',
+      'working_hours_end',
+      'holidays_json',
+      'auto_escalate',
+      'escalate_to_email',
+      'updated_at',
+    ],
+  },
+  {
+    table: 'dropdown_options',
+    mode: 'replace',
+    columns: ['id', 'group_key', 'label', 'value', 'sort_order', 'is_active', 'is_system', 'meta_json', 'created_at', 'updated_at'],
+  },
+  {
+    table: 'employees',
+    mode: 'replace',
+    columns: [
+      'id',
+      'user_id',
+      'employee_code',
+      'full_name',
+      'department_id',
+      'designation',
+      'mobile',
+      'email',
+      'location_id',
+      'reporting_manager',
+      'created_at',
+      'login_count',
+      'last_login_at',
+      'last_login_ip',
+    ],
+  },
+  {
+    table: 'moderators',
+    mode: 'replace',
+    columns: [
+      'id',
+      'user_id',
+      'employee_code',
+      'full_name',
+      'email',
+      'phone',
+      'specialization',
+      'assigned_location_ids',
+      'date_of_joining',
+      'status',
+      'performance_rating',
+      'max_capacity',
+      'created_at',
+    ],
+  },
+  {
+    table: 'it_assets',
+    mode: 'replace',
+    columns: [
+      'id',
+      'asset_tag',
+      'serial_number',
+      'category',
+      'brand',
+      'model',
+      'device_name',
+      'purchase_date',
+      'purchase_cost',
+      'warranty_expiry',
+      'warranty_provider',
+      'service_contract',
+      'assigned_employee_id',
+      'location_id',
+      'condition_status',
+      'notes',
+      'created_at',
+    ],
+  },
+  {
+    table: 'it_budgets',
+    mode: 'replace',
+    columns: ['id', 'fiscal_year', 'month', 'location_id', 'category', 'allocated_amount', 'notes', 'created_by_user_id', 'created_at'],
+  },
+  {
+    table: 'tickets',
+    mode: 'replace',
+    columns: [
+      'id',
+      'ticket_number',
+      'employee_id',
+      'created_by_user_id',
+      'reporter_name',
+      'reporter_employee_code',
+      'reporter_department',
+      'reporter_designation',
+      'reporter_mobile',
+      'reporter_email',
+      'reporter_branch_name',
+      'reporter_city',
+      'reporter_full_location',
+      'reporter_manager',
+      'location_id',
+      'department_id',
+      'category',
+      'device_type',
+      'device_name',
+      'asset_id',
+      'asset_serial_input',
+      'description',
+      'issue_occurred_at',
+      'business_impact',
+      'priority',
+      'status',
+      'assigned_moderator_id',
+      'deadline_at',
+      'sla_first_response_due',
+      'sla_resolution_due',
+      'sla_breached',
+      'first_response_at',
+      'assigned_at',
+      'accepted_at',
+      'work_started_at',
+      'work_completed_at',
+      'resolved_at',
+      'closed_at',
+      'total_working_minutes',
+      'visit_count',
+      'parts_replaced',
+      'expenses_incurred',
+      'resolution_description',
+      'employee_feedback',
+      'employee_confirmed',
+      'admin_verified',
+      'admin_verified_by',
+      'rejection_reason',
+      'created_at',
+      'updated_at',
+    ],
+  },
+  {
+    table: 'ticket_assignments',
+    mode: 'replace',
+    columns: ['id', 'ticket_id', 'moderator_id', 'assigned_by_user_id', 'action', 'reason', 'deadline_at', 'created_at'],
+  },
+  {
+    table: 'ticket_activities',
+    mode: 'replace',
+    columns: ['id', 'ticket_id', 'actor_user_id', 'actor_name', 'actor_role', 'action_type', 'previous_status', 'new_status', 'details', 'created_at'],
+  },
+  {
+    table: 'ticket_comments',
+    mode: 'replace',
+    columns: ['id', 'ticket_id', 'sender_user_id', 'sender_name', 'sender_role', 'channel', 'is_internal', 'message', 'created_at'],
+  },
+  {
+    table: 'ticket_time_logs',
+    mode: 'replace',
+    columns: ['id', 'ticket_id', 'moderator_id', 'started_at', 'ended_at', 'duration_minutes', 'work_type', 'notes', 'created_at'],
+  },
+  {
+    table: 'asset_maintenance',
+    mode: 'replace',
+    columns: ['id', 'asset_id', 'ticket_id', 'maintenance_type', 'description', 'vendor_id', 'cost', 'performed_at', 'performed_by', 'created_at'],
+  },
+  {
+    table: 'asset_history',
+    mode: 'replace',
+    columns: ['id', 'asset_id', 'event_type', 'previous_value', 'new_value', 'assigned_employee_id', 'location_id', 'actor_user_id', 'actor_name', 'notes', 'created_at'],
+  },
+  {
+    table: 'expenses',
+    mode: 'replace',
+    columns: [
+      'id',
+      'category',
+      'ticket_id',
+      'vendor_id',
+      'vendor_name',
+      'location_id',
+      'amount',
+      'invoice_number',
+      'invoice_attachment_path',
+      'payment_date',
+      'approval_status',
+      'approved_by_user_id',
+      'description',
+      'created_by_user_id',
+      'created_at',
+    ],
+  },
+  {
+    table: 'expense_approvals',
+    mode: 'replace',
+    columns: ['id', 'expense_id', 'approver_user_id', 'approver_name', 'decision', 'remarks', 'created_at'],
+  },
+  {
+    table: 'direct_messages',
+    mode: 'ignore',
+    columns: ['id', 'sender_user_id', 'recipient_user_id', 'ticket_id', 'message', 'is_read', 'read_at', 'created_at', 'conversation_scope', 'is_flagged_private'],
+  },
+  {
+    table: 'saved_reports',
+    mode: 'replace',
+    columns: ['id', 'report_type', 'title', 'filters_json', 'row_count', 'rows_json', 'created_by_user_id', 'created_by_name', 'created_by_role', 'created_at'],
+  },
+  {
+    table: 'retention_policies',
+    mode: 'replace',
+    columns: ['entity_key', 'label', 'retention_days', 'auto_archive', 'updated_by', 'updated_at'],
+  },
+  {
+    table: 'broadcast_notifications',
+    mode: 'replace',
+    columns: [
+      'id',
+      'title',
+      'message',
+      'category',
+      'display_mode',
+      'target_audience',
+      'target_user_ids_json',
+      'attachment_path',
+      'attachment_name',
+      'attachment_mime',
+      'starts_at',
+      'expires_at',
+      'is_active',
+      'scheduled_dispatched',
+      'created_by_user_id',
+      'created_at',
+      'updated_at',
+    ],
+  },
+  {
+    table: 'audit_logs',
+    mode: 'ignore',
+    columns: ['id', 'user_id', 'user_email', 'role_name', 'action', 'entity_type', 'entity_id', 'details_json', 'ip_address', 'created_at'],
+  },
+];
+
+function applyTableRowsRestore(tables: Record<string, any[]>, fallbackUserId: number): Record<string, number> {
+  const existingUserIds = new Set<number>(
+    (db.prepare('SELECT id FROM users').all() as Array<{ id: number }>).map((u) => u.id)
+  );
+  const restoredCounts: Record<string, number> = {};
+
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      for (const spec of RESTORE_ORDER) {
+        const rows = tables[spec.table];
+        if (!Array.isArray(rows) || rows.length === 0) {
+          restoredCounts[spec.table] = 0;
+          continue;
+        }
+
+        const tableCols = (db.prepare(`PRAGMA table_info('${spec.table}')`).all() as Array<{ name: string }>).map((c) => c.name);
+        const activeCols = spec.columns.filter((c) => tableCols.includes(c));
+        if (activeCols.length === 0) continue;
+
+        const verb = spec.mode === 'ignore' ? 'INSERT OR IGNORE' : 'INSERT OR REPLACE';
+        const placeholders = activeCols.map(() => '?').join(', ');
+        const stmt = db.prepare(`${verb} INTO ${spec.table} (${activeCols.join(', ')}) VALUES (${placeholders})`);
+
+        let count = 0;
+        for (const row of rows) {
+          if (!row || typeof row !== 'object') continue;
+          const values = activeCols.map((col) => {
+            let val = (row as any)[col];
+            if (col === 'created_by_user_id' && spec.table === 'tickets') {
+              if (!val || !existingUserIds.has(Number(val))) {
+                val = fallbackUserId;
+              }
+            }
+            if (col === 'user_id' && spec.table === 'employees' && val !== null && val !== undefined) {
+              if (!existingUserIds.has(Number(val))) {
+                val = null;
+              }
+            }
+            return val === undefined ? null : val;
+          });
+          const info = stmt.run(...values);
+          if (info.changes > 0) count += 1;
+        }
+        restoredCounts[spec.table] = count;
+      }
+    })();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
+
+  return restoredCounts;
+}
+
+// Restore CRM database from a JSON snapshot stored on the user's laptop (IndexedDB or .json file)
+router.post('/security/restore', requireAuth, requireRole('super_admin'), (req: AuthRequest, res) => {
+  const body = req.body as { system?: string; tables?: Record<string, any[]>; source?: string };
+  if (!body || typeof body !== 'object' || !body.tables || typeof body.tables !== 'object') {
+    return res.status(400).json({ error: 'Invalid database snapshot format. Expected { tables: { ... } }.' });
+  }
+  if (body.system && body.system !== 'SD Global IT CRM') {
+    return res.status(400).json({ error: 'Snapshot does not belong to SD Global IT CRM.' });
+  }
+
+  try {
+    const restoredCounts = applyTableRowsRestore(body.tables, req.user!.id);
+
+    writeAuditLog({
+      userId: req.user!.id,
+      userEmail: req.user!.email,
+      roleName: req.user!.role,
+      action: 'RESTORE_DB_FROM_LAPTOP',
+      entityType: 'database',
+      details: { source: body.source || 'laptop_json', restoredCounts },
+      ipAddress: req.ip,
+    });
+
+    broadcastAll('directory:updated', { entity: 'database', action: 'restored' });
+    broadcastAll('ticket:updated', { action: 'restored' });
+    broadcastAll('asset:updated', { action: 'restored' });
+    broadcastAll('budget:updated', { action: 'restored' });
+    broadcastAll('dropdowns:updated', { action: 'restored' });
+
+    res.json({ ok: true, restoredCounts });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Database restore failed' });
+  }
+});
+
+// Restore CRM database from an uploaded SQLite (.db) file from the user's laptop storage
+router.post(
+  '/security/restore-sqlite',
+  requireAuth,
+  requireRole('super_admin'),
+  sqliteRestoreUpload.single('database'),
+  (req: AuthRequest, res) => {
+    const uploaded = req.file;
+    if (!uploaded) {
+      return res.status(400).json({ error: 'Please select a .db SQLite database file from your laptop.' });
+    }
+
+    const tmpPath = uploaded.path;
+    let srcDb: Database.Database | null = null;
+    try {
+      const fd = fs.openSync(tmpPath, 'r');
+      const headerBuf = Buffer.alloc(16);
+      fs.readSync(fd, headerBuf, 0, 16, 0);
+      fs.closeSync(fd);
+
+      if (headerBuf.toString('utf8', 0, 15) !== 'SQLite format 3') {
+        return res.status(400).json({ error: 'Uploaded file is not a valid SQLite 3 (.db) database.' });
+      }
+
+      srcDb = new Database(tmpPath, { readonly: true });
+      const checkRow = srcDb.prepare('PRAGMA quick_check').get() as { quick_check?: string } | undefined;
+      if (checkRow?.quick_check !== 'ok') {
+        return res.status(400).json({ error: 'Uploaded SQLite database failed integrity check.' });
+      }
+
+      const existingTables = new Set(
+        (srcDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((t) => t.name)
+      );
+
+      const extractedTables: Record<string, any[]> = {};
+      for (const spec of RESTORE_ORDER) {
+        if (existingTables.has(spec.table)) {
+          extractedTables[spec.table] = srcDb.prepare(`SELECT * FROM ${spec.table}`).all();
+        }
+      }
+
+      srcDb.close();
+      srcDb = null;
+
+      const restoredCounts = applyTableRowsRestore(extractedTables, req.user!.id);
+
+      writeAuditLog({
+        userId: req.user!.id,
+        userEmail: req.user!.email,
+        roleName: req.user!.role,
+        action: 'RESTORE_SQLITE_FROM_LAPTOP',
+        entityType: 'database',
+        details: { filename: uploaded.originalname, restoredCounts },
+        ipAddress: req.ip,
+      });
+
+      broadcastAll('directory:updated', { entity: 'database', action: 'restored' });
+      broadcastAll('ticket:updated', { action: 'restored' });
+      broadcastAll('asset:updated', { action: 'restored' });
+      broadcastAll('budget:updated', { action: 'restored' });
+      broadcastAll('dropdowns:updated', { action: 'restored' });
+
+      return res.json({ ok: true, filename: uploaded.originalname, restoredCounts });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'SQLite restore failed' });
+    } finally {
+      if (srcDb) {
+        try {
+          srcDb.close();
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
+);
 
 export default router;

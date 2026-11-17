@@ -3,6 +3,7 @@ import {
   Bell,
   BellOff,
   ClipboardList,
+  Database,
   DollarSign,
   FileBarChart,
   Globe,
@@ -26,6 +27,7 @@ import { useAuth } from '../context/AuthContext.tsx';
 import { useTheme } from '../context/ThemeContext.tsx';
 import { BroadcastCategory } from '../types/index.ts';
 import { apiFetch, formatDateTime } from '../utils/api.ts';
+import { getLaptopDbStatus, getTargetDbFileName, LaptopDbStatus } from '../utils/laptopDb.ts';
 import BroadcastAttachmentLink from './broadcasts/BroadcastAttachmentLink.tsx';
 import SdGlobalLogo from './SdGlobalLogo.tsx';
 
@@ -42,6 +44,7 @@ export type NavSection =
   | 'traffic'
   | 'dropdowns'
   | 'integrations'
+  | 'database'
   | 'audit';
 
 interface LayoutProps {
@@ -111,6 +114,28 @@ export default function Layout({
   const [mfaMsg, setMfaMsg] = useState('');
   const [mfaErr, setMfaErr] = useState('');
   const [savingMfa, setSavingMfa] = useState(false);
+  const [laptopDbStatus, setLaptopDbStatus] = useState<LaptopDbStatus | null>(null);
+
+  useEffect(() => {
+    if (!user || user.role !== 'super_admin') {
+      setLaptopDbStatus(null);
+      return;
+    }
+    let mounted = true;
+    const loadLaptopStatus = () => {
+      getLaptopDbStatus()
+        .then((s) => {
+          if (mounted) setLaptopDbStatus(s);
+        })
+        .catch(() => {});
+    };
+    loadLaptopStatus();
+    window.addEventListener('sdgl:laptop-db-synced', loadLaptopStatus);
+    return () => {
+      mounted = false;
+      window.removeEventListener('sdgl:laptop-db-synced', loadLaptopStatus);
+    };
+  }, [user?.id, user?.role]);
 
   useEffect(() => {
     if (user && accountModalOpen) {
@@ -228,6 +253,12 @@ export default function Layout({
       id: 'integrations',
       label: 'Notifications, Outlook & SLA',
       icon: Settings,
+      roles: ['super_admin'],
+    },
+    {
+      id: 'database',
+      label: 'Laptop Storage DB',
+      icon: Database,
       roles: ['super_admin'],
     },
     {
@@ -500,6 +531,41 @@ export default function Layout({
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            {user.role === 'super_admin' && laptopDbStatus && (
+              <button
+                type="button"
+                onClick={() => onSelectSection('database')}
+                title={`Laptop Storage DB (${getTargetDbFileName()}) — Click to manage attachment & auto-sync`}
+                className={`hidden md:inline-flex items-center gap-2 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer whitespace-nowrap ${
+                  laptopDbStatus.autoSync &&
+                  laptopDbStatus.linkedFileName &&
+                  laptopDbStatus.linkedPermission === 'granted'
+                    ? 'border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/50'
+                    : 'border-amber-200 dark:border-amber-900 bg-amber-50/70 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300 hover:bg-amber-100/70 dark:hover:bg-amber-950/50'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    laptopDbStatus.autoSync &&
+                    laptopDbStatus.linkedFileName &&
+                    laptopDbStatus.linkedPermission === 'granted'
+                      ? 'bg-emerald-600'
+                      : 'bg-amber-500'
+                  }`}
+                />
+                <HardDrive className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden xl:inline">
+                  {laptopDbStatus.linkedFileName && laptopDbStatus.linkedPermission === 'granted'
+                    ? `${laptopDbStatus.linkedFileName} · Auto-Sync`
+                    : laptopDbStatus.linkedFileName && laptopDbStatus.linkedPermission === 'prompt'
+                    ? `Resume ${laptopDbStatus.linkedFileName}`
+                    : !laptopDbStatus.linkedFileName
+                    ? `Attach ${getTargetDbFileName()}`
+                    : 'Laptop DB · Paused'}
+                </span>
+              </button>
+            )}
+
             {/* Moderators cannot create tasks */}
             {user.role !== 'management' && user.role !== 'moderator' && (
               <button

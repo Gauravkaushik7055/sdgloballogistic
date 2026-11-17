@@ -28,11 +28,19 @@ export async function apiFetch<T = any>(url: string, options: RequestInit = {}):
     credentials: 'include',
   });
 
+  const contentType = res.headers.get('content-type') || '';
   const text = await res.text();
   let data: any = null;
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
+    if (res.ok) {
+      throw new Error(
+        contentType.includes('text/html')
+          ? 'Received HTML instead of JSON from API endpoint.'
+          : 'Invalid JSON response from server.'
+      );
+    }
     data = { raw: text };
   }
 

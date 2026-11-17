@@ -110,7 +110,15 @@ export default function LiveWebPage({
     else setRefreshing(true);
     try {
       const res = await apiFetch<LiveOverviewResponse>('/api/public/live-overview');
-      setOverview(res);
+      if (
+        res &&
+        typeof res === 'object' &&
+        res.metrics &&
+        Array.isArray(res.locations) &&
+        Array.isArray(res.sla_tiers)
+      ) {
+        setOverview(res);
+      }
     } catch {
       // Keep previous overview on transient errors
     } finally {
@@ -324,25 +332,25 @@ export default function LiveWebPage({
                 <div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">Active Logistics Hubs</div>
                   <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-slate-900 dark:text-white">
-                    {loadingOverview ? '--' : overview?.metrics.active_locations ?? 0}
+                    {loadingOverview ? '--' : overview?.metrics?.active_locations ?? 0}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">Active Support Queue</div>
                   <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-blue-700 dark:text-blue-400">
-                    {loadingOverview ? '--' : overview?.metrics.active_tickets ?? 0}
+                    {loadingOverview ? '--' : overview?.metrics?.active_tickets ?? 0}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">Verified Completed</div>
                   <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-emerald-700 dark:text-emerald-400">
-                    {loadingOverview ? '--' : overview?.metrics.completed_tickets ?? 0}
+                    {loadingOverview ? '--' : overview?.metrics?.completed_tickets ?? 0}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">Active SLA Tiers</div>
                   <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-slate-900 dark:text-white">
-                    {loadingOverview ? '--' : overview?.sla_tiers.length ?? 4}
+                    {loadingOverview ? '--' : overview?.sla_tiers?.length ?? 4}
                   </div>
                 </div>
               </div>
@@ -477,14 +485,14 @@ export default function LiveWebPage({
                             Loading connected locations...
                           </td>
                         </tr>
-                      ) : (overview?.locations || []).length === 0 ? (
+                      ) : (overview?.locations ?? []).length === 0 ? (
                         <tr>
                           <td colSpan={4} className="py-8 text-center text-slate-500">
                             No locations registered yet.
                           </td>
                         </tr>
                       ) : (
-                        overview?.locations.map((loc) => (
+                        (overview?.locations ?? []).map((loc) => (
                           <tr key={loc.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
                             <td className="py-3 px-4 font-mono font-semibold text-blue-700 dark:text-blue-400 whitespace-nowrap">
                               {loc.code}
@@ -795,7 +803,7 @@ export default function LiveWebPage({
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
             <span className="inline-flex items-center gap-1.5">
               <Clock className="w-3.5 h-3.5" />
-              <span>Support Desk: {overview?.company.support_email || 'techsupport@sdgloballogistics.com'}</span>
+              <span>Support Desk: {overview?.company?.support_email || 'techsupport@sdgloballogistics.com'}</span>
             </span>
             <span>&copy; {new Date().getFullYear()} SD Global</span>
           </div>

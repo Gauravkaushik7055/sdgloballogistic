@@ -139,10 +139,17 @@ async function startServer() {
     }
   });
 
+  const server = http.createServer(app);
+  attachRealtimeWebSocket(server);
+
   const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(path.resolve(process.cwd(), 'dist'));
   if (!isProd) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        ws: { server },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -153,9 +160,6 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
-
-  const server = http.createServer(app);
-  attachRealtimeWebSocket(server);
 
   const PORT = 3000;
   server.listen(PORT, '0.0.0.0', () => {
