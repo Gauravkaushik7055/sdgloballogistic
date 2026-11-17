@@ -25,9 +25,20 @@ import IntegrationsView from './components/integrations/IntegrationsView.tsx';
 import AuditSessionsView from './components/audit/AuditSessionsView.tsx';
 import LaptopDatabaseView from './components/database/LaptopDatabaseView.tsx';
 import { apiFetch, getAuthToken } from './utils/api.ts';
+import { getBrowserConsoleSeq } from './utils/consoleCapture.ts';
+import {
+  FullLogsBundlePayload,
+  getDriveAutoSyncEnabled,
+  getGoogleDriveAccessToken,
+  initGoogleDriveAuth,
+  isDriveWriteConfirmed,
+  recordDriveHeartbeatCheck,
+  syncAllDatabaseFilesToGoogleDrive,
+} from './utils/googleDriveSync.ts';
 import {
   getAutoSyncEnabled,
   getLaptopDbStatus,
+  getTargetDbFileName,
   LaptopSnapshotPayload,
   saveSnapshotToLaptopDb,
 } from './utils/laptopDb.ts';
@@ -66,53 +77,102 @@ function WorkspaceApp() {
     }
   }, [user?.id]);
 
-  // Background auto-sync between the server database and the Super Admin's Laptop Storage DB
+  // Continuous 1-second sync pulse for Server DB <-> Laptop DB & Google Drive Folder
   useEffect(() => {
     if (!user || user.role !== 'super_admin') return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let running = false;
 
-    const runSync = async () => {
-      if (running || !getAutoSyncEnabled()) return;
-      running = true;
+    const unsubAuth = initGoogleDriveAuth();
+    let cancelled = false;
+    let loopTimer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let lastLaptopFingerprint = '';
+    let lastDriveFingerprint = '';
+
+    const runPulseAndSync = async (force = false) => {
+      if (cancelled || inFlight) return;
+      const laptopEnabled = getAutoSyncEnabled();
+      const driveToken = getGoogleDriveAccessToken();
+      const driveReady = Boolean(driveToken) && isDriveWriteConfirmed() && getDriveAutoSyncEnabled();
+      if (!force && !laptopEnabled && !driveReady) return;
+
+      inFlight = true;
       try {
-        const [snapshot, status] = await Promise.all([
-          apiFetch<LaptopSnapshotPayload>('/api/auth/security/laptop-snapshot'),
-          getLaptopDbStatus(),
-        ]);
-        let sqliteBlob: Blob | null = null;
-        if (status.linkedFileName && status.linkedPermission === 'granted') {
-          const headers = new Headers();
-          const token = getAuthToken();
-          if (token) headers.set('Authorization', `Bearer ${token}`);
-          const sqlRes = await fetch('/api/auth/security/backup?format=sqlite', {
-            headers,
-            credentials: 'include',
-          });
-          if (sqlRes.ok) sqliteBlob = await sqlRes.blob();
+        const pulse = await apiFetch<{
+          fingerprint: string;
+          consoleSeq: number;
+        }>('/api/auth/security/sync-pulse');
+
+        if (driveReady) {
+          recordDriveHeartbeatCheck();
         }
-        await saveSnapshotToLaptopDb(snapshot, { sqliteBlob, interactive: false });
+
+        const browserSeq = getBrowserConsoleSeq();
+        const combinedDriveKey = `${pulse.fingerprint}::${browserSeq}`;
+
+        const needLaptop = laptopEnabled && (force || pulse.fingerprint !== lastLaptopFingerprint);
+        const needDrive = driveReady && (force || combinedDriveKey !== lastDriveFingerprint);
+
+        if (!needLaptop && !needDrive) {
+          return;
+        }
+
+        const laptopStatus = needLaptop ? await getLaptopDbStatus() : null;
+        const needSqliteBinary =
+          needDrive || Boolean(laptopStatus?.linkedFileName && laptopStatus.linkedPermission === 'granted');
+
+        const authHeaders = new Headers();
+        const token = getAuthToken();
+        if (token) authHeaders.set('Authorization', `Bearer ${token}`);
+
+        const [snapshot, fullLogs, sqliteBlob] = await Promise.all([
+          apiFetch<LaptopSnapshotPayload>('/api/auth/security/laptop-snapshot'),
+          needDrive
+            ? apiFetch<FullLogsBundlePayload>('/api/auth/security/full-logs-bundle')
+            : Promise.resolve(null),
+          needSqliteBinary
+            ? fetch('/api/auth/security/backup?format=sqlite&silent=1', {
+                headers: authHeaders,
+                credentials: 'include',
+              }).then((r) => (r.ok ? r.blob() : null))
+            : Promise.resolve(null),
+        ]);
+
+        if (needLaptop) {
+          await saveSnapshotToLaptopDb(snapshot, { sqliteBlob, interactive: false });
+          lastLaptopFingerprint = pulse.fingerprint;
+        }
+
+        if (needDrive && sqliteBlob && fullLogs) {
+          await syncAllDatabaseFilesToGoogleDrive({
+            sqliteBlob,
+            snapshot,
+            fullLogs,
+            targetDbFileName: getTargetDbFileName(),
+          });
+          lastDriveFingerprint = combinedDriveKey;
+        }
       } catch {
-        // Non-blocking background laptop sync
+        // Non-blocking continuous background sync
       } finally {
-        running = false;
+        inFlight = false;
       }
     };
 
-    const scheduleSync = () => {
-      if (!getAutoSyncEnabled()) return;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        runSync();
-      }, 4500);
+    const tick = async () => {
+      await runPulseAndSync(false);
+      if (!cancelled) {
+        loopTimer = setTimeout(tick, 1000);
+      }
     };
 
-    // Initial sync on Super Admin session start
-    runSync();
-    // Periodic safety sync every 2 minutes
-    const periodic = setInterval(runSync, 120000);
+    tick();
 
-    const unsub = subscribeRealtime((evt) => {
+    const onForceSync = () => {
+      runPulseAndSync(true);
+    };
+    window.addEventListener('sdgl:force-sync-now', onForceSync);
+
+    const unsubRealtime = subscribeRealtime((evt) => {
       if (
         evt.event.startsWith('ticket:') ||
         evt.event.startsWith('asset:') ||
@@ -122,14 +182,16 @@ function WorkspaceApp() {
         evt.event.startsWith('broadcast:') ||
         evt.event === 'chat:message'
       ) {
-        scheduleSync();
+        runPulseAndSync(false);
       }
     });
 
     return () => {
-      if (timer) clearTimeout(timer);
-      clearInterval(periodic);
-      unsub();
+      cancelled = true;
+      if (loopTimer) clearTimeout(loopTimer);
+      window.removeEventListener('sdgl:force-sync-now', onForceSync);
+      unsubRealtime();
+      unsubAuth();
     };
   }, [user?.id, user?.role, subscribeRealtime]);
 

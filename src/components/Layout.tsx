@@ -3,6 +3,7 @@ import {
   Bell,
   BellOff,
   ClipboardList,
+  Cloud,
   Database,
   DollarSign,
   FileBarChart,
@@ -27,6 +28,7 @@ import { useAuth } from '../context/AuthContext.tsx';
 import { useTheme } from '../context/ThemeContext.tsx';
 import { BroadcastCategory } from '../types/index.ts';
 import { apiFetch, formatDateTime } from '../utils/api.ts';
+import { DriveSyncStateSnapshot, getDriveSyncState } from '../utils/googleDriveSync.ts';
 import { getLaptopDbStatus, getTargetDbFileName, LaptopDbStatus } from '../utils/laptopDb.ts';
 import BroadcastAttachmentLink from './broadcasts/BroadcastAttachmentLink.tsx';
 import SdGlobalLogo from './SdGlobalLogo.tsx';
@@ -115,6 +117,7 @@ export default function Layout({
   const [mfaErr, setMfaErr] = useState('');
   const [savingMfa, setSavingMfa] = useState(false);
   const [laptopDbStatus, setLaptopDbStatus] = useState<LaptopDbStatus | null>(null);
+  const [driveSyncState, setDriveSyncState] = useState<DriveSyncStateSnapshot>(() => getDriveSyncState());
 
   useEffect(() => {
     if (!user || user.role !== 'super_admin') {
@@ -129,11 +132,17 @@ export default function Layout({
         })
         .catch(() => {});
     };
+    const loadDriveStatus = () => {
+      if (mounted) setDriveSyncState(getDriveSyncState());
+    };
     loadLaptopStatus();
+    loadDriveStatus();
     window.addEventListener('sdgl:laptop-db-synced', loadLaptopStatus);
+    window.addEventListener('sdgl:gdrive-status', loadDriveStatus);
     return () => {
       mounted = false;
       window.removeEventListener('sdgl:laptop-db-synced', loadLaptopStatus);
+      window.removeEventListener('sdgl:gdrive-status', loadDriveStatus);
     };
   }, [user?.id, user?.role]);
 
@@ -531,6 +540,35 @@ export default function Layout({
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            {user.role === 'super_admin' && (
+              <button
+                type="button"
+                onClick={() => onSelectSection('database')}
+                title={`Google Drive 1s Sync (Folder: ${driveSyncState.folderId})`}
+                className={`hidden md:inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer whitespace-nowrap ${
+                  driveSyncState.authenticated && driveSyncState.writeConfirmed && driveSyncState.autoSyncEnabled
+                    ? 'border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/50'
+                    : 'border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/50 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    driveSyncState.authenticated && driveSyncState.writeConfirmed && driveSyncState.autoSyncEnabled
+                      ? 'bg-emerald-600'
+                      : 'bg-amber-500'
+                  }`}
+                />
+                <Cloud className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden 2xl:inline">
+                  {driveSyncState.authenticated && driveSyncState.writeConfirmed && driveSyncState.autoSyncEnabled
+                    ? 'Drive · 1s Live'
+                    : driveSyncState.authenticated && !driveSyncState.writeConfirmed
+                    ? 'Confirm Drive Sync'
+                    : 'Drive Sync'}
+                </span>
+              </button>
+            )}
+
             {user.role === 'super_admin' && laptopDbStatus && (
               <button
                 type="button"

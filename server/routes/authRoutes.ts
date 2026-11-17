@@ -28,6 +28,7 @@ import {
 } from '../security.ts';
 import { dispatchWhatsAppMessage, getEffectiveWhatsAppConfig } from '../integrations.ts';
 import { broadcastAll, sendToRoles } from '../realtime.ts';
+import { getServerConsoleLogs, getServerConsoleSeq } from '../consoleLogBuffer.ts';
 
 const sqliteRestoreUpload = multer({
   storage: multer.diskStorage({
@@ -1540,17 +1541,20 @@ router.post('/security/retention/purge', requireAuth, requireRole('super_admin')
 
 router.get('/security/backup', requireAuth, requireRole('super_admin'), async (req: AuthRequest, res) => {
   const format = req.query.format === 'sqlite' ? 'sqlite' : 'json';
+  const silent = req.query.silent === '1';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 
-  writeAuditLog({
-    userId: req.user!.id,
-    userEmail: req.user!.email,
-    roleName: req.user!.role,
-    action: 'DOWNLOAD_DB_BACKUP',
-    entityType: 'database',
-    details: { format },
-    ipAddress: req.ip,
-  });
+  if (!silent) {
+    writeAuditLog({
+      userId: req.user!.id,
+      userEmail: req.user!.email,
+      roleName: req.user!.role,
+      action: 'DOWNLOAD_DB_BACKUP',
+      entityType: 'database',
+      details: { format },
+      ipAddress: req.ip,
+    });
+  }
 
   if (format === 'sqlite') {
     const tmpPath = path.join(os.tmpdir(), `sdglobal-it-crm-backup-${stamp}-${crypto.randomBytes(3).toString('hex')}.db`);
@@ -1680,6 +1684,14 @@ router.get('/security/laptop-snapshot', requireAuth, requireRole('super_admin'),
       retention_policies: db.prepare('SELECT * FROM retention_policies').all(),
       broadcast_notifications: db.prepare('SELECT * FROM broadcast_notifications ORDER BY id ASC').all(),
       audit_logs: db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 5000').all(),
+      login_sessions: db.prepare('SELECT * FROM login_sessions ORDER BY id DESC LIMIT 2000').all(),
+      notifications: db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 2000').all(),
+      email_communications: db.prepare('SELECT * FROM email_communications ORDER BY id DESC LIMIT 2000').all(),
+      whatsapp_communications: db.prepare('SELECT * FROM whatsapp_communications ORDER BY id DESC LIMIT 2000').all(),
+      website_visits: db.prepare('SELECT * FROM website_visits ORDER BY id DESC LIMIT 3000').all(),
+      asset_import_batches: db.prepare('SELECT * FROM asset_import_batches ORDER BY id DESC LIMIT 500').all(),
+      admin_permissions: db.prepare('SELECT * FROM admin_permissions ORDER BY id ASC').all(),
+      roles: db.prepare('SELECT * FROM roles ORDER BY id ASC').all(),
     };
 
     const tableCounts: Record<string, number> = {};
@@ -1697,6 +1709,132 @@ router.get('/security/laptop-snapshot', requireAuth, requireRole('super_admin'),
     });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to build laptop database snapshot' });
+  }
+});
+
+// Lightweight 1-second change detection pulse for continuous Laptop + Google Drive synchronization
+router.get('/security/sync-pulse', requireAuth, requireRole('super_admin'), (_req: AuthRequest, res) => {
+  try {
+    let dbMtimeMs = 0;
+    let dbSizeBytes = 0;
+    let walMtimeMs = 0;
+    let walSizeBytes = 0;
+    try {
+      if (fs.existsSync(DB_PATH)) {
+        const st = fs.statSync(DB_PATH);
+        dbMtimeMs = Math.floor(st.mtimeMs);
+        dbSizeBytes = st.size;
+      }
+      const walPath = `${DB_PATH}-wal`;
+      if (fs.existsSync(walPath)) {
+        const wst = fs.statSync(walPath);
+        walMtimeMs = Math.floor(wst.mtimeMs);
+        walSizeBytes = wst.size;
+      }
+    } catch {
+      // ignore stat errors
+    }
+
+    const pulseRow = db
+      .prepare(
+        `SELECT
+          (SELECT COALESCE(MAX(id), 0) FROM audit_logs) as auditMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM ticket_activities) as ticketActivityMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM login_sessions) as loginSessionMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM tickets) as ticketMaxId,
+          (SELECT COALESCE(MAX(updated_at), '') FROM tickets) as ticketUpdatedMax,
+          (SELECT COALESCE(MAX(id), 0) FROM direct_messages) as chatMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM website_visits) as visitMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM notifications) as notifMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM it_assets) as assetMaxId,
+          (SELECT COALESCE(MAX(id), 0) FROM expenses) as expenseMaxId`
+      )
+      .get() as any;
+
+    const consoleSeq = getServerConsoleSeq();
+    const fingerprint = [
+      dbMtimeMs,
+      dbSizeBytes,
+      walMtimeMs,
+      walSizeBytes,
+      pulseRow?.auditMaxId || 0,
+      pulseRow?.ticketActivityMaxId || 0,
+      pulseRow?.loginSessionMaxId || 0,
+      pulseRow?.ticketMaxId || 0,
+      pulseRow?.ticketUpdatedMax || '',
+      pulseRow?.chatMaxId || 0,
+      pulseRow?.visitMaxId || 0,
+      pulseRow?.notifMaxId || 0,
+      pulseRow?.assetMaxId || 0,
+      pulseRow?.expenseMaxId || 0,
+      consoleSeq,
+    ].join('|');
+
+    res.json({
+      fingerprint,
+      dbMtimeMs,
+      dbSizeBytes,
+      walMtimeMs,
+      walSizeBytes,
+      auditMaxId: Number(pulseRow?.auditMaxId || 0),
+      consoleSeq,
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to read database sync pulse' });
+  }
+});
+
+// Complete logs, console buffer, sessions, and DB telemetry bundle for Google Drive continuous archival
+router.get('/security/full-logs-bundle', requireAuth, requireRole('super_admin'), (_req: AuthRequest, res) => {
+  try {
+    let dbSizeBytes = 0;
+    let walSizeBytes = 0;
+    try {
+      if (fs.existsSync(DB_PATH)) dbSizeBytes = fs.statSync(DB_PATH).size;
+      if (fs.existsSync(`${DB_PATH}-wal`)) walSizeBytes = fs.statSync(`${DB_PATH}-wal`).size;
+    } catch {
+      // ignore stat errors
+    }
+
+    const tableNames = (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC")
+        .all() as Array<{ name: string }>
+    ).map((r) => r.name);
+
+    const tableCounts: Record<string, number> = {};
+    for (const tbl of tableNames) {
+      try {
+        const row = db.prepare(`SELECT COUNT(*) as cnt FROM "${tbl.replace(/"/g, '')}"`).get() as { cnt: number };
+        tableCounts[tbl] = Number(row?.cnt || 0);
+      } catch {
+        tableCounts[tbl] = 0;
+      }
+    }
+
+    res.json({
+      system: 'SD Global IT CRM',
+      generatedAt: new Date().toISOString(),
+      dbPath: DB_PATH,
+      dbSizeBytes,
+      walSizeBytes,
+      consoleSeq: getServerConsoleSeq(),
+      tableCounts,
+      serverConsoleLogs: getServerConsoleLogs(1500),
+      auditLogs: db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 5000').all(),
+      ticketActivities: db.prepare('SELECT * FROM ticket_activities ORDER BY id DESC LIMIT 3000').all(),
+      loginSessions: db.prepare('SELECT * FROM login_sessions ORDER BY id DESC LIMIT 1000').all(),
+      emailCommunications: db.prepare('SELECT * FROM email_communications ORDER BY id DESC LIMIT 1000').all(),
+      whatsappCommunications: db.prepare('SELECT * FROM whatsapp_communications ORDER BY id DESC LIMIT 1000').all(),
+      websiteVisits: db.prepare('SELECT * FROM website_visits ORDER BY id DESC LIMIT 1000').all(),
+      assetHistory: db.prepare('SELECT * FROM asset_history ORDER BY id DESC LIMIT 1000').all(),
+      assetImportBatches: db.prepare('SELECT * FROM asset_import_batches ORDER BY id DESC LIMIT 500').all(),
+      expenseApprovals: db.prepare('SELECT * FROM expense_approvals ORDER BY id DESC LIMIT 1000').all(),
+      notifications: db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 1000').all(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to build full logs bundle' });
   }
 });
 

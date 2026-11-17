@@ -38,6 +38,7 @@ import {
   unlinkLaptopDiskFile,
 } from '../../utils/laptopDb.ts';
 import { formatBytesCompact } from '../common/MediaPreviewModal.tsx';
+import GoogleDriveSyncCard from './GoogleDriveSyncCard.tsx';
 
 export default function LaptopDatabaseView() {
   const [status, setStatus] = useState<LaptopDbStatus | null>(null);
@@ -62,12 +63,12 @@ export default function LaptopDatabaseView() {
   const osPaths = getLaptopPathsForOs();
   const targetFileName = getTargetDbFileName(targetPath);
 
-  const fetchSqliteBlob = useCallback(async (): Promise<Blob | null> => {
+  const fetchSqliteBlob = useCallback(async (silent = true): Promise<Blob | null> => {
     try {
       const token = getAuthToken();
       const headers = new Headers();
       if (token) headers.set('Authorization', `Bearer ${token}`);
-      const res = await fetch('/api/auth/security/backup?format=sqlite', {
+      const res = await fetch(`/api/auth/security/backup?format=sqlite${silent ? '&silent=1' : ''}`, {
         headers,
         credentials: 'include',
       });
@@ -416,6 +417,9 @@ export default function LaptopDatabaseView() {
           )}
         </div>
       )}
+
+      {/* Google Drive Real-Time 1-Second Folder Sync */}
+      <GoogleDriveSyncCard />
 
       {/* Attached Laptop File & Auto-Sync Status Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

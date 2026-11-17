@@ -4,6 +4,7 @@ import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+import { installServerConsoleCapture } from './server/consoleLogBuffer.ts';
 import { initializeDatabase, syncDepartmentDropdownOptions } from './server/db.ts';
 import { seedDatabaseIfEmpty } from './server/seed.ts';
 import { attachRealtimeWebSocket } from './server/realtime.ts';
@@ -16,6 +17,8 @@ import publicRoutes from './server/routes/publicRoutes.ts';
 import broadcastRoutes, { startBroadcastScheduler } from './server/routes/broadcastRoutes.ts';
 import trafficRoutes from './server/routes/trafficRoutes.ts';
 import { getEffectiveOutlookConfig, saveIntegrationSetting } from './server/integrations.ts';
+
+installServerConsoleCapture();
 
 async function startServer() {
   initializeDatabase();
